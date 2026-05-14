@@ -1,0 +1,5 @@
+add_subdirectory(catchtests)
+include(Catch)
+add_subdirectory(cpp)
+add_subdirectory(fpga)
+add_subdirectory(apps)

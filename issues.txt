@@ -1,0 +1,154 @@
+Repository bug review
+Reviewed revision: 866307f
+
+Scope: first-party host libraries, AFK server/frontend/RTL, reusable RTL,
+examples, build configuration and test infrastructure. Dependencies' source
+code and generated build products are excluded. Findings describe the reviewed
+revision; subsequent fix status is recorded on the relevant issue.
+P1 = high impact; P2 = functional bug worth fixing.
+
+1. [FIXED, originally P1] Ending an order does not reset the cart or agent history
+   Fix: Done Ordering clears the visible cart locally and through a server
+   Cart.clear action. Restored the original implementation's administrative
+   handoff prompt on the existing Codex thread, followed by discarding its
+   response. The prompt tells the agent the current customer is done and a new
+   customer will arrive shortly. Removed the alternative fresh-thread reset.
+   Regression coverage includes the exact prompt, unchanged thread ID, unique
+   request IDs, consecutive handoffs, suppression of late administrative replies,
+   and button-driven cart clearing.
+   Validation: rebuilt afk_host/test_afk_core; all 58 CTest tests passed.
+   Original finding:
+   Locations: apps/afk/frontend/js/kiosk.js:51-55;
+   apps/afk/server/src/DialogueSession.cpp:177-184;
+   apps/afk/server/src/CodexAgent.cpp:135-136.
+   After adding an item, click Done Ordering, then Tap to Order. The old item
+   is still in the cart. The frontend clears only Conversation; FinishCustomer
+   clears pending work and speech, and DiscardPendingResponse clears only a
+   local optional. Every later agent request still uses the same thread ID.
+   Consequently the next customer inherits both visible order contents and
+   the previous customer's agent context. The administrative reset described
+   in system_prompt.md is never sent. Reset the visible cart and establish a
+   fresh customer context together. Evidence: traced the complete reset path.
+
+2. [P1] Substring triggers apply incomplete or unintended order changes
+   Locations: apps/afk/server/src/TriggerManager.cpp:28-33;
+   apps/afk/fpga/afk_condition_evaluator.sv:145-159;
+   apps/afk/server/src/DialogueSession.cpp:214-217,239-260.
+   "Can I get a classic cheeseburger and fries?" contains the programmed
+   cheeseburger substring. An FPGA win adds only the burger and suppresses
+   the agent's response for the entire request, silently losing the fries.
+   Likewise "Can I get a classic cheeseburger without cheese?" loses its
+   qualification, and "Don't get a classic cheeseburger" still adds one.
+   Matching can fire before the stimulus ends, so trailing qualifications
+   cannot prevent the action. Restrict fast-path eligibility to requests it
+   can fully handle, or validate the complete request before applying actions.
+   Evidence: deterministic consequence of the configured substring matcher
+   and winner arbitration; no physical-board test performed.
+
+3. [P1] Backend errors or unusable final replies leave the request queue stuck
+   Locations: apps/afk/server/src/Backends.cpp:17-19;
+   apps/afk/server/src/DialogueSession.cpp:187-210,220-236.
+   An accepted request remains active if the agent returns malformed text and
+   then completes, completes without text, or rejects/fails the turn. Empty
+   completion events are ignored, and CodexBackend turns expected errors into
+   an indistinguishable empty poll. For an ordinary request that does not
+   match an FPGA trigger there will be no other reply. Every later request
+   queues behind the abandoned request until the customer resets. FPGA send
+   success also keeps a request active when agent Send failed, even though
+   unmatched FPGA requests intentionally receive no response. Propagate
+   backend terminal status and implement a terminal failure/recovery path.
+   Evidence: standalone C++ reproduction supplied an invalid final reply and
+   completion, then another request; only one request was dispatched even
+   after advancing time by 24 hours.
+
+4. [P1] A Codex read failure terminates the whole kiosk server
+   Locations: apps/afk/server/src/CodexProcess.cpp:244-245;
+   apps/afk/server/src/Backends.cpp:17-19; apps/afk/server/main.cpp:66-68.
+   EOF, a truncated line, or an oversized response makes future_response.get()
+   throw boost::system::system_error. Neither the backend adapter nor the
+   periodic main loop catches it. If the Codex child exits during a request,
+   HTTP, WebSocket and ordering service all terminate instead of reporting
+   a backend failure. Catch transport exceptions at the service boundary and
+   recover or fail the active request explicitly. Evidence: existing transport
+   tests verify these exceptions; inspected the uncaught production call path.
+
+5. [P2] Malformed packets permanently block later host messages on that channel
+   Locations: fpga/host/fdk/fpga/message/MessageReceiver.h:21-28;
+   fpga/host/fdk/fpga/message/MessageReader.h:48-57.
+   A short channel packet, or a header whose msg_size is invalid, returns
+   nullopt without consuming the complete packet. MessageReader interprets
+   nullopt as no queued message, so it never removes that packet. All valid
+   messages queued behind it become inaccessible, including later ACKs.
+   Discard invalid complete channel packets and continue scanning.
+   Evidence: C++ reproduction queued a one-byte packet followed by a valid
+   EchoResponse; try_read returned false with both packets still queued.
+
+6. [OUT OF SCOPE] Truncated messages with incorrect declared lengths
+   The sender is responsible for supplying the declared number of bytes.
+   Additional receiver validation for this malformed input is not required
+   under the agreed scope. No RTL change requested.
+
+7. [P2] Echo responses inherit the current input channel instead of their own
+   Location: examples/basys3/uart_echo_channels/request_handler.sv:52-66.
+   out_channel_id is wired directly to in_channel_id even while message_tx
+   holds a pending valid response. Input frames can advance independently of
+   response transmission. Interleaving an unsupported channel while an echo
+   response is pending can therefore emit its frames under that other channel
+   ID. Changing the input ID also changes a stalled output's metadata. Only
+   channel 5 is supported, so bind responses to that channel and make response
+   processing independent of the current input selection. Evidence: focused
+   cocotb simulation held a channel-5 response stalled, changed the input ID
+   to 255, and observed the pending valid response change to channel 255.
+
+8. [P2] A pause deadline can commit the preview while the customer is speaking
+   Locations: apps/afk/server/src/DialogueSession.cpp:141-168,265-270.
+   Only committed speech moves pause_deadline_. After a committed chunk,
+   continuing speech can produce tentative text for several seconds without
+   another commit. The old deadline still expires. FlushTranscript commits
+   the latest frontend preview, including that tentative suffix, but sends
+   only transcript_ (the earlier committed prefix) to the backends. The UI
+   thus shows words as submitted that were not in the request, and the request
+   can run while the customer is still extending it. Track ongoing speech
+   when deciding that a pause has ended, and commit exactly the submitted text.
+   Evidence: C++ reproduction committed "one burger", supplied tentative
+   "and fries" at the deadline, and observed immediate UI commit and dispatch
+   of the earlier transcript.
+
+9. [P2] Multiple spoken messages unmute capture before playback finishes
+   Locations: apps/afk/frontend/js/conversation.js:23-26;
+   apps/afk/frontend/js/agent_messages.js:47-56.
+   Agent batches can contain multiple Conversation.addSystemMessage actions.
+   Their speech promises run concurrently. Every promise independently mutes
+   on entry and unmutes in finally, so finishing the first message unmutes
+   the microphone while the second is still speaking. Speaker audio can then
+   reach STT and generate unintended requests. BrowserSpeaker's per-sentence
+   scheduling can also interleave sentences from concurrent messages.
+   Serialize complete speech requests or retain muting until all playback
+   finishes. Evidence: Node reproduction started two messages, finished only
+   the first, and observed setMuted(false) while the second remained pending.
+
+10. [P2] Server accepts winning replies that the frontend refuses to execute
+    Locations: apps/afk/server/src/DialogueSession.cpp:20-30,214-217;
+    apps/afk/frontend/js/agent_messages.js:4-43.
+    StrToJson accepts an empty messages array, unknown action names, missing
+    action fields, invalid quantities and unknown items. Such a reply wins
+    arbitration and discards the other backend, but frontend validation rejects
+    the entire batch and only logs an error. For example {"messages":[]} or
+    {"messages":[{"type":"Cart.addItems"}]} consumes the active request with no
+    visible result. Validate the same executable action schema at arbitration
+    time so invalid replies cannot defeat a valid fallback. Evidence: direct
+    comparison of validators; the existing server test explicitly forwards
+    an unsupported custom action that the frontend rejects.
+
+Validation
+- Rebuilt test_afk_core and test_fdk_core in the existing Release build.
+- CTest: 57/57 passed after rerunning outside the sandbox. The initial socket
+  write failures were sandbox restrictions, not repository bugs.
+- Build-tool pytest suite: 6/6 passed.
+- Both existing frontend Node test scripts passed.
+- Focused C++/Node/cocotb reproductions described above were kept under /tmp;
+  they demonstrate faulty behavior and do not change repository tests.
+- Reusable RTL, AFK RTL and Basys3 simulation pytest selection: 96 passed,
+  2 host integration tests deselected. Initial ccache write failures were
+  sandbox restrictions; the suites passed after rerunning outside the sandbox.
+- No live Codex conversation, physical FPGA, or browser microphone test used.

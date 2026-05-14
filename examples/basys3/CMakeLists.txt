@@ -1,0 +1,2 @@
+add_subdirectory(uart_echo_bytes)
+add_subdirectory(uart_echo_channels)

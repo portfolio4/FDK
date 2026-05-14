@@ -1,0 +1,12 @@
+venv/*
+__pycache__/
+.pytest_cache/
+examples/**/build/
+vivado*.log
+vivado*.jou
+.Xil/
+build.tcl
+
+/build/
+/build_debug/
+/build_release/
